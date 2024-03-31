@@ -1,0 +1,309 @@
+services:
+  mongodb:
+    image: mongo:5.0.26-focal
+    restart: unless-stopped
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/lila:/lila
+      - ./scripts:/scripts
+
+  redis:
+    image: redis:7.2.4-alpine3.19
+    restart: unless-stopped
+    networks:
+      - lila-network
+
+  lila:
+    image: sbtscala/scala-sbt:eclipse-temurin-alpine-21.0.2_13_1.9.9_3.4.1
+    working_dir: /lila
+    entrypoint: ./lila run
+    restart: unless-stopped
+    networks:
+      - lila-network
+    environment:
+      - LILA_DOMAIN=${LILA_DOMAIN:-localhost:8080}
+      - LILA_URL=${LILA_URL:-http://localhost:8080}
+      - ENABLE_MONITORING=${ENABLE_MONITORING:-false}
+    volumes:
+      - ./repos/lila:/lila
+      - ./repos/chessground:/chessground
+      - ./repos/pgn-viewer:/pgn-viewer
+      - ./repos/bbpPairings:/opt/bbpPairings
+      - ./repos/scalachess:/scalachess
+      - ./conf/lila.conf:/lila/conf/application.conf
+
+  lila_ws:
+    image: sbtscala/scala-sbt:eclipse-temurin-alpine-21.0.2_13_1.9.9_3.4.1
+    working_dir: /lila-ws
+    entrypoint: sbt run -Dconfig.file=/lila-ws.conf
+    restart: unless-stopped
+    networks:
+      - lila-network
+    environment:
+      - LILA_URL=${LILA_URL:-http://localhost:8080}
+      - ENABLE_MONITORING=${ENABLE_MONITORING:-false}
+    volumes:
+      - ./repos/lila-ws:/lila-ws
+      - ./conf/lila-ws.conf:/lila-ws.conf
+
+  nginx:
+    image: nginx:1.25.4-alpine3.18-slim
+    restart: unless-stopped
+    networks:
+      - lila-network
+    ports:
+      - 8080:80
+    volumes:
+      - ./conf/nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./repos/lila/public:/lila/public
+      - ./repos/lifat:/lifat
+      - ./nginx:/nginx
+    depends_on:
+      - lila
+      - lila_ws
+
+  mobile:
+    build:
+      context: docker
+      dockerfile: mobile.Dockerfile
+    environment:
+      - LILA_URL=${LILA_URL:-http://localhost:8080}
+    tty: true
+    volumes:
+      - ./repos/dartchess:/dartchess
+      - ./repos/mobile:/app
+    profiles:
+      - mobile
+
+  api_docs:
+    image: node:20.12.0-alpine3.19
+    working_dir: /api/doc
+    entrypoint: ["/bin/sh", "-c", "npm install && npm run serve -- --host=0.0.0.0"]
+    restart: unless-stopped
+    ports:
+      - 8089:8089
+    volumes:
+      - ./repos/api:/api
+    profiles:
+      - api-docs
+
+  chessground:
+    build:
+      context: docker
+      dockerfile: ui.Dockerfile
+    entrypoint: ["/bin/sh", "-c", "pnpm install && pnpm run compile && pnpx http-server -p 8080"]
+    restart: unless-stopped
+    ports:
+      - 8090:8080
+    volumes:
+      - ./repos/chessground:/app
+    profiles:
+      - chessground
+
+  pgn_viewer:
+    build:
+      context: docker
+      dockerfile: ui.Dockerfile
+    entrypoint: ["/bin/sh", "-c", "pnpm install && pnpm run demo"]
+    restart: unless-stopped
+    ports:
+      - 8091:8080
+    volumes:
+      - ./repos/pgn-viewer:/app
+    profiles:
+      - pgn-viewer
+
+  lila_engine:
+    image: rust:1.77.0-slim-bookworm
+    working_dir: /lila-engine
+    entrypoint: cargo run -- --bind 0.0.0.0:9666 --mongodb mongodb://mongodb
+    restart: unless-stopped
+    environment:
+      - LILA_ENGINE_LOG=lila_engine=debug,tower_http=debug
+    networks:
+      - lila-network
+    ports:
+      - 9666:9666
+    volumes:
+      - ./repos/lila-engine:/lila-engine
+    profiles:
+      - external-engine
+
+  lila_fishnet:
+    image: sbtscala/scala-sbt:eclipse-temurin-alpine-21.0.2_13_1.9.9_3.4.1
+    working_dir: /lila-fishnet
+    entrypoint: sbt app/run
+    environment:
+      - APP_BACKUP_FILE=/backup.json
+      - CONFIG_FORCE_kamon_influxdb_authentication_token=secret
+      - CONFIG_FORCE_kamon_influxdb_hostname=influxdb
+      - KAMON_ENABLED=${ENABLE_MONITORING:-false}
+      - REDIS_HOST=redis
+      # - HTTP_API_LOGGER=true
+    restart: unless-stopped
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/lila-fishnet:/lila-fishnet
+    profiles:
+      - stockfish-play
+
+  fishnet_play:
+    image: niklasf/fishnet:2.9.2
+    restart: unless-stopped
+    entrypoint: /fishnet --endpoint http://lila_fishnet:9665/fishnet --max-backoff 5
+    networks:
+      - lila-network
+    profiles:
+      - stockfish-play
+
+  fishnet_analysis:
+    image: niklasf/fishnet:2.9.2
+    restart: unless-stopped
+    entrypoint: /fishnet --endpoint http://lila:9663/fishnet --max-backoff 5
+    networks:
+      - lila-network
+    profiles:
+      - stockfish-analysis
+
+  python:
+    build:
+      context: docker
+      dockerfile: python.Dockerfile
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/berserk:/berserk
+      - ./repos/lila-db-seed:/lila-db-seed
+      - ./scripts:/scripts
+    profiles:
+      - utils
+
+  ui:
+    build:
+      context: docker
+      dockerfile: ui.Dockerfile
+    restart: unless-stopped
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/lila:/lila
+      - ./repos/chessground:/chessground
+      - ./repos/pgn-viewer:/pgn-viewer
+    profiles:
+      - utils
+
+  elasticsearch:
+    image: elasticsearch:7.17.4
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - http.cors.allow-origin=/.*/
+      - http.cors.enabled=true
+      - xpack.security.enabled=false
+    networks:
+      - lila-network
+    ports:
+      - 9200:9200
+    profiles:
+      - search
+
+  elasticvue:
+    image: cars10/elasticvue:1.0.4
+    restart: unless-stopped
+    volumes:
+      - ./conf/elasticvue.json:/usr/share/nginx/html/api/default_clusters.json
+    ports:
+      - 8092:8080
+    networks:
+      - lila-network
+    profiles:
+      - search
+
+  lila_search:
+    image: sbtscala/scala-sbt:eclipse-temurin-alpine-21.0.2_13_1.9.9_2.13.13
+    working_dir: /lila-search
+    entrypoint: ["/bin/sh", "-c", "sbt stage && ./target/universal/stage/bin/lila-search"]
+    restart: unless-stopped
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/lila-search:/lila-search
+      - ./conf/lila-search.conf:/lila-search/conf/application.conf
+    profiles:
+      - search
+
+  lila_gif:
+    image: rust:1.77.0-slim-bookworm
+    working_dir: /lila-gif
+    entrypoint: cargo run -- --bind 0.0.0.0:6175
+    restart: unless-stopped
+    ports:
+      - 6175:6175
+    networks:
+      - lila-network
+    volumes:
+      - ./repos/lila-gif:/lila-gif
+    profiles:
+      - gifs
+
+  picfit:
+    build:
+      context: docker
+      dockerfile: picfit.Dockerfile
+    ports:
+      - 3001:3001
+    networks:
+      - lila-network
+    volumes:
+      - ./conf/picfit.json:/mnt/config.json
+      - ./docker/assets:/uploads
+    profiles:
+      - thumbnails
+
+  mailpit:
+    image: axllent/mailpit:v1.15.1
+    restart: unless-stopped
+    ports:
+      - 8025:8025
+    networks:
+      - lila-network
+    profiles:
+      - email
+
+  mongo_express:
+    image: mongo-express:1.0.2-20-alpine3.19
+    restart: unless-stopped
+    ports:
+      - 8081:8081
+    environment:
+      - ME_CONFIG_BASICAUTH=false
+      - ME_CONFIG_MONGODB_SERVER=mongodb
+    networks:
+      - lila-network
+    depends_on:
+      - mongodb
+    profiles:
+      - mongo-express
+
+  influxdb:
+    image: influxdb:2.7.5-alpine
+    restart: unless-stopped
+    ports:
+      - 8086:8086
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=secret
+      - DOCKER_INFLUXDB_INIT_ORG=lila-docker
+      - DOCKER_INFLUXDB_INIT_BUCKET=kamon
+    networks:
+      - lila-network
+    profiles:
+      - monitoring
+
+networks:
+  lila-network:
+    driver: bridge
